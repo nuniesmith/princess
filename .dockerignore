@@ -1,0 +1,8 @@
+.git
+.github
+docs
+provision
+*.md
+.env
+.env.example
+run.sh

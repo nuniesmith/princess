@@ -1,0 +1,238 @@
+name: 👑 Provision Princess (Linode)
+
+# One-time (idempotent) provisioning of the princess edge server:
+# a $5/mo Nanode in Toronto running Ubuntu 26.04 LTS, bootstrapped by
+# cloud-init (provision/cloud-init.yaml). Safe to re-run — if a Linode
+# labelled "princess" already exists it just reports its IP.
+#
+# The Tailscale join is AUTOMATED: the OAuth client secret is used directly
+# as an auth key (tailscale.com/kb/1215 — requires the client to have the
+# auth_keys scope; the node comes up tag-owned, so no key expiry). The only
+# step left for you is updating the PRINCESS_TAILSCALE_IP repo secret with the
+# IP this workflow prints. See docs/PROVISIONING.md.
+
+on:
+    workflow_dispatch:
+        inputs:
+            confirm:
+                description: 'Type "princess" to confirm creating a billable Linode instance'
+                required: true
+            instance_type:
+                description: Linode instance type
+                default: g6-nanode-1
+            region:
+                description: Linode region
+                default: ca-central
+            image:
+                description: Linode image
+                default: linode/ubuntu26.04
+            tailscale_tag:
+                description: Tag for the tailnet node (must be grantable by the OAuth client)
+                default: "tag:ci"
+            advertise_exit_node:
+                description: Advertise princess as a Tailscale exit node
+                type: boolean
+                default: true
+
+permissions:
+    contents: read
+
+env:
+    INSTANCE_LABEL: princess
+
+jobs:
+    provision:
+        name: 🏗️ Provision Linode
+        runs-on: ubuntu-latest
+        if: inputs.confirm == 'princess'
+        steps:
+            - name: 📥 Checkout
+              uses: actions/checkout@v4
+
+            - name: 🔎 Check for existing instance
+              id: existing
+              env:
+                  LINODE_API_KEY: ${{ secrets.LINODE_API_KEY }}
+              run: |
+                  RESP=$(curl -sf -H "Authorization: Bearer $LINODE_API_KEY" \
+                    "https://api.linode.com/v4/linode/instances")
+                  IP=$(echo "$RESP" | jq -r --arg l "$INSTANCE_LABEL" \
+                    '.data[] | select(.label == $l) | .ipv4[0] // empty')
+                  if [ -n "$IP" ]; then
+                    echo "exists=true" >> "$GITHUB_OUTPUT"
+                    echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+                    echo "::notice::Linode '$INSTANCE_LABEL' already exists at $IP — skipping create"
+                  else
+                    echo "exists=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: 🔑 Derive public keys from SSH secrets
+              id: keys
+              if: steps.existing.outputs.exists == 'false'
+              env:
+                  SSH_KEY: ${{ secrets.SSH_KEY }}
+                  ROOT_SSH_KEY: ${{ secrets.ROOT_SSH_KEY }}
+              run: |
+                  umask 077
+                  echo "$SSH_KEY" > /tmp/actions_key
+                  echo "$ROOT_SSH_KEY" > /tmp/root_key
+                  ACTIONS_PUB=$(ssh-keygen -y -f /tmp/actions_key)
+                  ROOT_PUB=$(ssh-keygen -y -f /tmp/root_key)
+                  echo "actions_pub=$ACTIONS_PUB" >> "$GITHUB_OUTPUT"
+                  echo "root_pub=$ROOT_PUB" >> "$GITHUB_OUTPUT"
+                  rm -f /tmp/actions_key
+
+            - name: 📄 Render cloud-init user data
+              id: userdata
+              if: steps.existing.outputs.exists == 'false'
+              run: |
+                  sed "s|__ACTIONS_PUBKEY__|${{ steps.keys.outputs.actions_pub }}|" \
+                    provision/cloud-init.yaml > /tmp/cloud-init.rendered.yaml
+                  if grep -q '__ACTIONS_PUBKEY__' /tmp/cloud-init.rendered.yaml; then
+                    echo "::error::cloud-init placeholder substitution failed"; exit 1
+                  fi
+                  echo "b64=$(base64 -w0 /tmp/cloud-init.rendered.yaml)" >> "$GITHUB_OUTPUT"
+
+            - name: 🏗️ Create Linode instance
+              id: create
+              if: steps.existing.outputs.exists == 'false'
+              env:
+                  LINODE_API_KEY: ${{ secrets.LINODE_API_KEY }}
+              run: |
+                  # Root password is required by the API but never used (SSH keys
+                  # only, PasswordAuthentication off) — random and discarded.
+                  ROOT_PASS=$(openssl rand -base64 32)
+                  BODY=$(jq -n \
+                    --arg label "$INSTANCE_LABEL" \
+                    --arg region "${{ inputs.region }}" \
+                    --arg type "${{ inputs.instance_type }}" \
+                    --arg image "${{ inputs.image }}" \
+                    --arg root_pass "$ROOT_PASS" \
+                    --arg key "${{ steps.keys.outputs.root_pub }}" \
+                    --arg user_data "${{ steps.userdata.outputs.b64 }}" \
+                    '{label: $label, region: $region, type: $type, image: $image,
+                      root_pass: $root_pass, authorized_keys: [$key], booted: true,
+                      tags: ["princess", "edge"],
+                      metadata: {user_data: $user_data}}')
+                  RESP=$(curl -sf -X POST "https://api.linode.com/v4/linode/instances" \
+                    -H "Authorization: Bearer $LINODE_API_KEY" \
+                    -H "Content-Type: application/json" \
+                    --data "$BODY") || { echo "::error::Linode create failed"; exit 1; }
+                  echo "id=$(echo "$RESP" | jq -r .id)" >> "$GITHUB_OUTPUT"
+                  echo "public_ip=$(echo "$RESP" | jq -r '.ipv4[0]')" >> "$GITHUB_OUTPUT"
+
+            - name: ⏳ Wait for instance to boot
+              if: steps.existing.outputs.exists == 'false'
+              env:
+                  LINODE_API_KEY: ${{ secrets.LINODE_API_KEY }}
+              run: |
+                  for i in $(seq 1 40); do
+                    STATUS=$(curl -sf -H "Authorization: Bearer $LINODE_API_KEY" \
+                      "https://api.linode.com/v4/linode/instances/${{ steps.create.outputs.id }}" | jq -r .status)
+                    echo "status: $STATUS (attempt $i)"
+                    [ "$STATUS" = "running" ] && exit 0
+                    sleep 15
+                  done
+                  echo "::error::instance did not reach 'running' in 10 minutes"; exit 1
+
+            - name: ⏳ Wait for cloud-init to finish
+              if: steps.existing.outputs.exists == 'false'
+              continue-on-error: true
+              env:
+                  ROOT_SSH_KEY: ${{ secrets.ROOT_SSH_KEY }}
+              run: |
+                  umask 077
+                  mkdir -p ~/.ssh
+                  echo "$ROOT_SSH_KEY" > ~/.ssh/root_key
+                  IP="${{ steps.create.outputs.public_ip }}"
+                  # SSH comes up before cloud-init finishes; retry until reachable
+                  for i in $(seq 1 30); do
+                    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/root_key \
+                        root@"$IP" "cloud-init status --wait" 2>/dev/null; then
+                      echo "✅ cloud-init complete"
+                      rm -f ~/.ssh/root_key
+                      exit 0
+                    fi
+                    echo "waiting for SSH... (attempt $i)"
+                    sleep 20
+                  done
+                  rm -f ~/.ssh/root_key
+                  echo "::warning::could not confirm cloud-init completion — check manually"
+
+            - name: 🔗 Join Tailscale (OAuth secret as auth key)
+              id: tailscale-join
+              if: steps.existing.outputs.exists == 'false'
+              env:
+                  ROOT_SSH_KEY: ${{ secrets.ROOT_SSH_KEY }}
+                  TS_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+              run: |
+                  umask 077
+                  mkdir -p ~/.ssh
+                  echo "$ROOT_SSH_KEY" > ~/.ssh/root_key
+                  IP="${{ steps.create.outputs.public_ip }}"
+
+                  EXIT_FLAG=""
+                  if [ "${{ inputs.advertise_exit_node }}" = "true" ]; then
+                    EXIT_FLAG="--advertise-exit-node"
+                  fi
+
+                  # OAuth client secret used directly as an auth key
+                  # (tailscale.com/kb/1215): node is created tag-owned (no key
+                  # expiry), non-ephemeral, preauthorized.
+                  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i ~/.ssh/root_key root@"$IP" \
+                    "tailscale up \
+                       --auth-key='${TS_OAUTH_SECRET}?ephemeral=false&preauthorized=true' \
+                       --advertise-tags='${{ inputs.tailscale_tag }}' \
+                       --hostname=princess \
+                       --accept-routes $EXIT_FLAG"
+
+                  TS_IP=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/root_key root@"$IP" "tailscale ip -4 | head -1")
+                  rm -f ~/.ssh/root_key
+                  if [ -z "$TS_IP" ]; then
+                    echo "::error::tailscale join appeared to succeed but no IPv4 was assigned"
+                    exit 1
+                  fi
+                  echo "ts_ip=$TS_IP" >> "$GITHUB_OUTPUT"
+                  echo "::notice::princess joined the tailnet as $TS_IP"
+
+            - name: 📋 Summary
+              if: always()
+              run: |
+                  IP="${{ steps.existing.outputs.public_ip || steps.create.outputs.public_ip }}"
+                  TS_IP="${{ steps.tailscale-join.outputs.ts_ip }}"
+                  {
+                    echo "## 👑 Princess provisioning"
+                    echo ""
+                    echo "| | |"
+                    echo "|---|---|"
+                    echo "| Public IP | \`$IP\` (dark — nothing binds here) |"
+                    echo "| Tailscale IP | \`${TS_IP:-join skipped/failed}\` |"
+                    echo "| Region | ${{ inputs.region }} |"
+                    echo "| Type | ${{ inputs.instance_type }} (\$5/mo) |"
+                    echo "| Image | ${{ inputs.image }} |"
+                    echo ""
+                    echo "### Next steps"
+                    echo "1. Update the \`PRINCESS_TAILSCALE_IP\` repo secret to \`${TS_IP:-<tailscale ip -4>}\`"
+                    if [ "${{ inputs.advertise_exit_node }}" = "true" ]; then
+                      echo "2. Approve the **exit node** in the Tailscale admin console (Machines → princess → Edit route settings)"
+                    fi
+                    echo "3. Run the **👑 Princess Deploy** workflow (or push to main)"
+                    echo "4. Optional hardening: close public SSH once the tailnet path works — \`ufw delete allow 22/tcp\`"
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: 📣 Notify
+              if: always()
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "👑 Princess Provisioning"
+                  description: "Linode edge server provisioning"
+                  status: ${{ job.status == 'success' && 'success' || 'failure' }}
+                  include-repo-info: true
+                  fields: |
+                      [
+                        {"name": "Public IP", "value": "${{ steps.existing.outputs.public_ip || steps.create.outputs.public_ip || 'n/a' }}", "inline": true},
+                        {"name": "Region", "value": "${{ inputs.region }}", "inline": true},
+                        {"name": "Existed", "value": "${{ steps.existing.outputs.exists }}", "inline": true}
+                      ]

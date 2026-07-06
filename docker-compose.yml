@@ -1,0 +1,72 @@
+# princess — edge reverse proxy for 7gram.xyz
+#
+# One container: nginx terminates TLS for every *.7gram.xyz subdomain and
+# proxies over the Tailscale network to the home servers:
+#   freddy   (${FREDDY_TAILSCALE_IP})   — nextcloud, photoprism, authentik, …
+#   sullivan (${SULLIVAN_TAILSCALE_IP}) — emby, plex, *arr stack, …
+#
+# TLS certs live in the external `ssl-certs` Docker volume, populated by the
+# CI/CD pipeline (Let's Encrypt wildcard via Cloudflare DNS-01) — same
+# mechanism as freddy. Create once: docker volume create ssl-certs
+
+x-logging: &default-logging
+    driver: json-file
+    options:
+        max-size: "10m"
+        max-file: "3"
+
+services:
+    nginx:
+        build:
+            context: .
+            dockerfile: ./docker/nginx/Dockerfile
+        container_name: nginx
+        environment:
+            TZ: ${TZ:-America/Toronto}
+            SSL_DOMAIN: ${SSL_DOMAIN:-7gram.xyz}
+            # Tailnet IPs of the backend servers. The entrypoint substitutes
+            # these over the baked-in defaults in nginx.conf at startup.
+            FREDDY_TAILSCALE_IP: ${FREDDY_TAILSCALE_IP:-100.106.65.55}
+            SULLIVAN_TAILSCALE_IP: ${SULLIVAN_TAILSCALE_IP:-100.87.125.19}
+        volumes:
+            - ssl-certs:/etc/letsencrypt-volume:ro
+        # Tailscale runs on the HOST; the container reaches the 100.x backends
+        # through the host's tailscale0 interface via default Docker NAT.
+        #
+        # TAILNET-ONLY: ports bind to the host's Tailscale IP (BIND_IP, set by
+        # `run.sh setup-env` from `tailscale ip -4`). Docker-published ports
+        # bypass UFW, so binding to the tailscale IP — not firewall rules — is
+        # what keeps the public Linode IP dark. Local dev falls back to
+        # 127.0.0.1.
+        ports:
+            - "${BIND_IP:-127.0.0.1}:80:80"
+            - "${BIND_IP:-127.0.0.1}:443:443"
+        restart: unless-stopped
+        security_opt:
+            - no-new-privileges:true
+        logging: *default-logging
+        networks:
+            - princess
+        healthcheck:
+            # Port 80's default server answers /health for any Host; the HTTPS
+            # default server is the 444 catch-all, so a bare-IP HTTPS probe
+            # would be dropped by design.
+            test: ["CMD-SHELL", "curl -sf http://localhost/health || exit 1"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 15s
+        deploy:
+            resources:
+                limits:
+                    memory: 256M
+
+volumes:
+    # SSL certificates volume (shared between CI/CD and nginx).
+    # External — created by CI/CD (or `run.sh start`), not managed by compose.
+    ssl-certs:
+        external: true
+
+networks:
+    princess:
+        driver: bridge

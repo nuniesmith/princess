@@ -1,0 +1,109 @@
+#cloud-config
+# princess bootstrap — mirrors freddy/sullivan's setup-prod-server.sh, adapted
+# for a public Linode. Rendered by .github/workflows/provision.yml, which
+# replaces __ACTIONS_PUBKEY__ with the public key derived from the SSH_KEY
+# secret. Linode requires this base64-encoded in metadata.user_data (max 64KB)
+# and it CANNOT be changed after create — keep this bootstrap-only; everything
+# else deploys via GitHub Actions over SSH.
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - ca-certificates
+  - ufw
+  - fail2ban
+  - git
+
+users:
+  # CI/CD user (SSH-key-only; added to docker group in runcmd once docker exists)
+  - name: actions
+    gecos: GitHub Actions CI/CD User
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __ACTIONS_PUBKEY__
+  # Interactive admin user
+  - name: jordan
+    gecos: Jordan
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIISPnlFyF55VSInQ2MTULrBgwwKrSJfIpqiU9y9jtgTb jordan@desktop
+
+write_files:
+  # Same hardening directives as freddy's drop-in (renamed for princess)
+  - path: /etc/ssh/sshd_config.d/99-princess-hardening.conf
+    permissions: "0644"
+    content: |
+      # Princess Server SSH Hardening
+      PermitRootLogin prohibit-password
+      PasswordAuthentication no
+      ChallengeResponseAuthentication no
+      UsePAM yes
+      PermitEmptyPasswords no
+      MaxAuthTries 3
+      MaxSessions 5
+      LoginGraceTime 30
+      X11Forwarding no
+      Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+      MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+      KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+      LogLevel VERBOSE
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+      AllowUsers actions jordan root
+
+  # Docker daemon hardening (same as freddy)
+  - path: /etc/docker/daemon.json
+    permissions: "0644"
+    content: |
+      {
+          "log-driver": "json-file",
+          "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+          },
+          "live-restore": true,
+          "userland-proxy": false,
+          "no-new-privileges": true,
+          "storage-driver": "overlay2"
+      }
+
+  - path: /etc/fail2ban/jail.local
+    permissions: "0644"
+    content: |
+      [sshd]
+      enabled = true
+      maxretry = 5
+      bantime = 3600
+      findtime = 600
+
+runcmd:
+  # Docker CE (official convenience script uses the same download.docker.com repo)
+  - curl -fsSL https://get.docker.com | sh
+  - usermod -aG docker actions
+  - systemctl enable --now docker
+  # Firewall: TAILNET-ONLY model — no public 80/443. nginx binds to the
+  # tailscale IP (BIND_IP in .env), because Docker-published ports bypass UFW;
+  # the bind address, not the firewall, is what keeps the public IP dark.
+  # 22 stays open (key-only + fail2ban) as the bootstrap/rescue path; close it
+  # after the tailnet join if you want (docs/PROVISIONING.md §5).
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp
+  - ufw allow in on tailscale0
+  - ufw --force enable
+  - systemctl enable --now fail2ban
+  # Tailscale — installed but NOT joined (manual `tailscale up`, same as
+  # freddy/sullivan; the OAuth secrets are only for ephemeral CI runners)
+  - curl -fsSL https://tailscale.com/install.sh | sh
+  # IP forwarding so this node can be a Tailscale exit node / subnet router
+  - printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' > /etc/sysctl.d/99-tailscale.conf
+  - sysctl -p /etc/sysctl.d/99-tailscale.conf
+  - systemctl restart ssh
+  - touch /var/lib/cloud/princess-bootstrap-done
+
+final_message: "princess bootstrap complete after $UPTIME seconds"

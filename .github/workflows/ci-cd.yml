@@ -1,0 +1,270 @@
+name: 👑 Princess Deploy
+
+# Edge deploy, mirroring freddy's pipeline: dns-update -> deploy -> summary.
+# - Deploys over Tailscale (runner joins as an ephemeral tag:ci node).
+# - SSL: wildcard Let's Encrypt cert via Cloudflare DNS-01, generated on the
+#   runner, shipped into the external `ssl-certs` Docker volume.
+# - DNS: apex + wildcard A records -> princess's TAILSCALE IP (same model as
+#   freddy today: only devices on the tailnet can reach anything; the public
+#   Linode IP serves nothing). Cutover away from freddy ONLY runs when
+#   explicitly requested (workflow_dispatch + update_dns). See docs/CUTOVER.md.
+
+on:
+    push:
+        branches: [main]
+        paths-ignore:
+            - "**.md"
+            - "docs/**"
+            - ".gitignore"
+    workflow_dispatch:
+        inputs:
+            skip_deploy:
+                description: Skip the deploy job
+                type: boolean
+                default: false
+            update_dns:
+                description: "Point 7gram.xyz DNS at princess (CUTOVER — moves traffic off freddy)"
+                type: boolean
+                default: false
+            force_ssl_regen:
+                description: Force SSL certificate regeneration
+                type: boolean
+                default: false
+            use_staging_certs:
+                description: Use Let's Encrypt staging environment
+                type: boolean
+                default: false
+    schedule:
+        # Weekly — keeps the wildcard cert renewed (<30 days triggers regen)
+        - cron: "0 3 * * 0"
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    SERVER_NAME: princess
+    PROJECT_PATH: princess
+    DOMAIN: 7gram.xyz
+
+jobs:
+    # ==========================================================================
+    # DNS — deliberate cutover only (unlike freddy, never runs on plain push)
+    # ==========================================================================
+    dns-update:
+        name: 🌐 DNS Cutover
+        runs-on: ubuntu-latest
+        if: github.event_name == 'workflow_dispatch' && inputs.update_dns
+        steps:
+            - name: 🌐 Update DNS records (apex + wildcard → princess tailnet IP)
+              id: dns-princess
+              uses: nuniesmith/actions/.github/actions/cloudflare-dns-update@main
+              with:
+                  api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  zone-id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+                  record-name: ${{ env.DOMAIN }}
+                  # TAILNET-ONLY (freddy's exact model): records point at the
+                  # 100.x Tailscale IP, so only devices logged into the tailnet
+                  # can reach any service. proxied MUST stay false — Cloudflare
+                  # cannot reach CGNAT addresses.
+                  record-content: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+                  record-type: A
+                  ttl: "1"
+                  proxied: "false"
+                  additional-records: |
+                      [
+                        {"name": "*.7gram.xyz", "content": "${{ secrets.PRINCESS_TAILSCALE_IP }}"}
+                      ]
+
+    # ==========================================================================
+    # DEPLOY
+    # ==========================================================================
+    deploy:
+        name: 🚀 Deploy to Princess
+        runs-on: ubuntu-latest
+        needs: [dns-update]
+        # needs is satisfied also when dns-update is skipped
+        if: |
+            always() &&
+            (needs.dns-update.result == 'success' || needs.dns-update.result == 'skipped') &&
+            github.event_name != 'pull_request' &&
+            (github.event_name != 'workflow_dispatch' || !inputs.skip_deploy)
+        steps:
+            - name: 📥 Checkout
+              uses: actions/checkout@v4
+
+            - name: 🔌 Connect to Tailscale
+              id: tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  target-ip: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+                  target-ssh-port: ${{ secrets.SSH_PORT || '22' }}
+
+            - name: 🔍 Check SSL certificate status
+              id: check-certs
+              if: steps.tailscale.outputs.connected == 'true'
+              env:
+                  SSH_KEY: ${{ secrets.SSH_KEY }}
+              run: |
+                  umask 077
+                  mkdir -p ~/.ssh
+                  echo "$SSH_KEY" > ~/.ssh/id_rsa
+
+                  NEEDS_RENEWAL=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa \
+                    -p ${{ secrets.SSH_PORT || '22' }} \
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.PRINCESS_TAILSCALE_IP }} \
+                    "docker volume inspect ssl-certs >/dev/null 2>&1 && \
+                     docker run --rm -v ssl-certs:/certs alpine sh -c \
+                       'apk add --no-cache openssl >/dev/null 2>&1 && \
+                        openssl x509 -checkend 2592000 -noout -in /certs/live/${{ env.DOMAIN }}/fullchain.pem' \
+                       >/dev/null 2>&1 && echo false || echo true")
+
+                  rm -f ~/.ssh/id_rsa
+                  echo "needs_renewal=$NEEDS_RENEWAL" >> "$GITHUB_OUTPUT"
+                  echo "::notice::SSL needs renewal: $NEEDS_RENEWAL (missing cert or <30 days left)"
+
+            - name: 🔐 Generate SSL Certificates (Let's Encrypt + Cloudflare DNS)
+              id: certbot
+              if: steps.tailscale.outputs.connected == 'true' && (steps.check-certs.outputs.needs_renewal == 'true' || inputs.force_ssl_regen == true)
+              uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
+              with:
+                  domain: ${{ env.DOMAIN }}
+                  # Wildcards cover all service subdomains (same set as freddy)
+                  additional-domains: "*.7gram.xyz,*.sullivan.7gram.xyz"
+                  cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+                  email: ${{ secrets.SSL_EMAIL }}
+                  propagation-seconds: 60
+                  staging: ${{ inputs.use_staging_certs || false }}
+                  fallback-to-self-signed: true
+                  deploy-to-server: false
+
+            - name: 📦 Deploy SSL certificates to ssl-certs volume
+              if: steps.certbot.outcome == 'success' && steps.tailscale.outputs.connected == 'true'
+              env:
+                  SSH_KEY: ${{ secrets.SSH_KEY }}
+              run: |
+                  umask 077
+                  mkdir -p ~/.ssh
+                  echo "$SSH_KEY" > ~/.ssh/id_rsa
+
+                  scp -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -P ${{ secrets.SSH_PORT || '22' }} \
+                    /tmp/ssl-certs.tar.gz \
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.PRINCESS_TAILSCALE_IP }}:/tmp/ssl-certs.tar.gz
+
+                  ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p ${{ secrets.SSH_PORT || '22' }} \
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.PRINCESS_TAILSCALE_IP }} << 'ENDSSH'
+                  docker volume inspect ssl-certs >/dev/null 2>&1 || docker volume create ssl-certs
+                  docker run --rm -v ssl-certs:/certs -v /tmp:/tmp busybox \
+                    sh -c "cd /certs && tar -xzf /tmp/ssl-certs.tar.gz && ls -la /certs/live/ && echo 'Certificates deployed successfully'"
+                  rm -f /tmp/ssl-certs.tar.gz
+                  ENDSSH
+
+                  rm -f ~/.ssh/id_rsa
+
+            - name: 🚀 Deploy via SSH
+              id: deploy
+              if: steps.tailscale.outputs.connected == 'true'
+              uses: nuniesmith/actions/.github/actions/ssh-deploy@main
+              with:
+                  host: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+                  port: ${{ secrets.SSH_PORT || '22' }}
+                  username: ${{ secrets.SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.SSH_KEY }}
+                  project-path: ${{ env.PROJECT_PATH }}
+                  git-pull: false
+                  git-branch: ${{ github.ref_name }}
+                  docker-prune: false
+                  pre-deploy-command: |
+                      # Clone or update the repo at $HOME/princess
+                      if [ -d "$HOME/${{ env.PROJECT_PATH }}/.git" ]; then
+                          cd $HOME/${{ env.PROJECT_PATH }}
+                          git fetch origin
+                          git checkout ${{ github.ref_name }}
+                          git pull origin ${{ github.ref_name }} || git reset --hard origin/${{ github.ref_name }}
+                      else
+                          git clone https://github.com/${{ github.repository }}.git $HOME/${{ env.PROJECT_PATH }}
+                          cd $HOME/${{ env.PROJECT_PATH }}
+                      fi
+
+                      # .env is generated on the server, never copied from the runner
+                      chmod +x ./run.sh 2>/dev/null || true
+                      ./run.sh setup-env
+
+                      # Override backend tailnet IPs from repo secrets when present
+                      if [ -n "${{ secrets.FREDDY_TAILSCALE_IP }}" ]; then
+                          sed -i "s|^FREDDY_TAILSCALE_IP=.*|FREDDY_TAILSCALE_IP=${{ secrets.FREDDY_TAILSCALE_IP }}|" .env
+                      fi
+                      if [ -n "${{ secrets.SULLIVAN_TAILSCALE_IP }}" ]; then
+                          sed -i "s|^SULLIVAN_TAILSCALE_IP=.*|SULLIVAN_TAILSCALE_IP=${{ secrets.SULLIVAN_TAILSCALE_IP }}|" .env
+                      fi
+                      chmod 600 .env
+                  deploy-command: |
+                      cd $HOME/${{ env.PROJECT_PATH }}
+                      docker compose down --remove-orphans 2>/dev/null || true
+                      if ! docker volume inspect ssl-certs >/dev/null 2>&1; then
+                          docker volume create ssl-certs
+                      fi
+                      docker compose build nginx
+                      docker compose up -d --pull always --force-recreate --remove-orphans
+                      echo "✅ Deployment complete"
+                  post-deploy-command: |
+                      cd $HOME/${{ env.PROJECT_PATH }}
+                      docker compose ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || docker ps --format "table {{.Names}}\t{{.Status}}"
+
+            - name: 🏥 Run Health Checks
+              id: health-checks
+              if: always() && steps.deploy.outcome == 'success'
+              uses: nuniesmith/actions/.github/actions/health-check@main
+              with:
+                  # Note: health-check action expects SPACE-separated container names
+                  containers: nginx
+                  ssh-host: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+                  ssh-port: ${{ secrets.SSH_PORT || '22' }}
+                  ssh-user: ${{ secrets.SSH_USER || 'actions' }}
+                  ssh-key: ${{ secrets.SSH_KEY }}
+                  initial-delay: 15
+                  retry-count: 3
+                  retry-delay: 10
+                  fail-on-unhealthy: false
+
+            - name: 📣 Notify deployment
+              if: always()
+              uses: nuniesmith/actions/.github/actions/discord-notify@main
+              continue-on-error: true
+              with:
+                  webhook-url: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  title: "👑 Princess Deployment"
+                  description: "Edge server (nginx + Tailscale proxy) deployment"
+                  status: ${{ steps.deploy.outcome == 'success' && 'success' || 'failure' }}
+                  include-repo-info: true
+                  fields: |
+                      [
+                        {"name": "Server", "value": "Princess", "inline": true},
+                        {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true},
+                        {"name": "Health", "value": "${{ steps.health-checks.outputs.healthy == 'true' && '✅ Healthy' || '⚠️ Check Required' }}", "inline": true}
+                      ]
+
+    # ==========================================================================
+    # SUMMARY
+    # ==========================================================================
+    summary:
+        name: 📋 Summary
+        runs-on: ubuntu-latest
+        needs: [dns-update, deploy]
+        if: always()
+        steps:
+            - name: 📋 Write summary
+              run: |
+                  {
+                    echo "## 👑 Princess Pipeline"
+                    echo ""
+                    echo "| Job | Result |"
+                    echo "|---|---|"
+                    echo "| DNS cutover | ${{ needs.dns-update.result }} |"
+                    echo "| Deploy | ${{ needs.deploy.result }} |"
+                  } >> "$GITHUB_STEP_SUMMARY"
