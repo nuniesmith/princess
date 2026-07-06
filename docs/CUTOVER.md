@@ -27,6 +27,14 @@ tailnet to freddy/sullivan.
      | openssl x509 -noout -issuer     # expect Let's Encrypt
    ```
 
+4. **Freddy-side proxy trust** — after cutover the proxy hitting the backends
+   is princess (source = its tailscale IP), not freddy's local nginx:
+   - **Home Assistant** hard-fails (400) on untrusted `X-Forwarded-For`
+     senders: add princess's tailscale IP (or `100.64.0.0/10`) to
+     `http: trusted_proxies:` in HA's configuration.yaml on freddy + restart.
+   - **Nextcloud**: add the same to `trusted_proxies` in config.php (soft
+     failure only — client IPs would be misattributed otherwise).
+
 ## Cutover
 
 GitHub → Actions → **👑 Princess Deploy** → Run workflow → check

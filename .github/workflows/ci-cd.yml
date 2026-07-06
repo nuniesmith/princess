@@ -105,6 +105,25 @@ jobs:
                   target-ip: ${{ secrets.PRINCESS_TAILSCALE_IP }}
                   target-ssh-port: ${{ secrets.SSH_PORT || '22' }}
 
+            - name: 🧪 Preflight — target sanity
+              env:
+                  TARGET: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+              run: |
+                  if [ "${{ steps.tailscale.outputs.connected }}" != "true" ]; then
+                    echo "::error::Runner failed to join the tailnet — check TAILSCALE_OAUTH_CLIENT_ID/SECRET (needs auth_keys scope, tag:ci)"
+                    exit 1
+                  fi
+                  case "$TARGET" in
+                    100.*) : ;;
+                    *)
+                      echo "::error::PRINCESS_TAILSCALE_IP secret is not a Tailscale IP (expected 100.x.y.z). If princess isn't provisioned yet, run the '👑 Provision Princess (Linode)' workflow first, then set this secret to the IP it prints."
+                      exit 1 ;;
+                  esac
+                  if [ "${{ steps.tailscale.outputs.ssh-reachable }}" != "true" ]; then
+                    echo "::error::Cannot reach $TARGET:${{ secrets.SSH_PORT || '22' }} over the tailnet. Is the server up and joined (provision workflow), and does the ACL allow tag:ci -> princess:22?"
+                    exit 1
+                  fi
+
             - name: 🔍 Check SSL certificate status
               id: check-certs
               if: steps.tailscale.outputs.connected == 'true'
@@ -115,14 +134,18 @@ jobs:
                   mkdir -p ~/.ssh
                   echo "$SSH_KEY" > ~/.ssh/id_rsa
 
+                  # needs_renewal=true when: cert missing, <30 days left, or the
+                  # issuer is not Let's Encrypt (e.g. a self-signed cert ever
+                  # landed in the volume — never let that state persist).
                   NEEDS_RENEWAL=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa \
                     -p ${{ secrets.SSH_PORT || '22' }} \
                     ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.PRINCESS_TAILSCALE_IP }} \
                     "docker volume inspect ssl-certs >/dev/null 2>&1 && \
                      docker run --rm -v ssl-certs:/certs alpine sh -c \
                        'apk add --no-cache openssl >/dev/null 2>&1 && \
-                        openssl x509 -checkend 2592000 -noout -in /certs/live/${{ env.DOMAIN }}/fullchain.pem' \
-                       >/dev/null 2>&1 && echo false || echo true")
+                        openssl x509 -checkend 2592000 -noout -in /certs/live/${{ env.DOMAIN }}/fullchain.pem && \
+                        openssl x509 -issuer -noout -in /certs/live/${{ env.DOMAIN }}/fullchain.pem | grep -qi encrypt' \
+                       >/dev/null 2>&1 && echo false || echo true") || NEEDS_RENEWAL=true
 
                   rm -f ~/.ssh/id_rsa
                   echo "needs_renewal=$NEEDS_RENEWAL" >> "$GITHUB_OUTPUT"
@@ -130,6 +153,11 @@ jobs:
 
             - name: 🔐 Generate SSL Certificates (Let's Encrypt + Cloudflare DNS)
               id: certbot
+              # continue-on-error + no self-signed fallback: if LE fails, the
+              # volume stays as-is, nginx serves its baked-in fallback cert, and
+              # the next run retries. (A self-signed cert shipped into the
+              # volume would otherwise pass the expiry check for ~11 months.)
+              continue-on-error: true
               if: steps.tailscale.outputs.connected == 'true' && (steps.check-certs.outputs.needs_renewal == 'true' || inputs.force_ssl_regen == true)
               uses: nuniesmith/actions/.github/actions/ssl-certbot-cloudflare@main
               with:
@@ -140,7 +168,7 @@ jobs:
                   email: ${{ secrets.SSL_EMAIL }}
                   propagation-seconds: 60
                   staging: ${{ inputs.use_staging_certs || false }}
-                  fallback-to-self-signed: true
+                  fallback-to-self-signed: false
                   deploy-to-server: false
 
             - name: 📦 Deploy SSL certificates to ssl-certs volume
@@ -205,11 +233,13 @@ jobs:
                       chmod 600 .env
                   deploy-command: |
                       cd $HOME/${{ env.PROJECT_PATH }}
-                      docker compose down --remove-orphans 2>/dev/null || true
                       if ! docker volume inspect ssl-certs >/dev/null 2>&1; then
                           docker volume create ssl-certs
                       fi
+                      # Build BEFORE down — keeps the edge-dark window to
+                      # seconds instead of the whole image build
                       docker compose build nginx
+                      docker compose down --remove-orphans 2>/dev/null || true
                       docker compose up -d --pull always --force-recreate --remove-orphans
                       echo "✅ Deployment complete"
                   post-deploy-command: |

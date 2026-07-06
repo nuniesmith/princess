@@ -48,11 +48,18 @@ cmd_logs()    { docker compose logs -f "${1:-nginx}"; }
 cmd_status()  { docker compose ps; }
 
 cmd_health() {
-    curl -sf http://localhost/health && echo "HTTP  ✅"
+    # nginx binds BIND_IP (the tailscale IP on the server) — not localhost
+    local bind_ip domain
+    bind_ip=$(grep -E '^BIND_IP=' .env 2>/dev/null | cut -d= -f2)
+    bind_ip="${bind_ip:-127.0.0.1}"
+    domain=$(grep -E '^SSL_DOMAIN=' .env 2>/dev/null | cut -d= -f2)
+    domain="${domain:-7gram.xyz}"
+
+    curl -sf "http://${bind_ip}/health" && echo "HTTP  ✅ (${bind_ip})"
     # Host header needed: the HTTPS default server drops unknown hosts (444)
-    curl -skf -H "Host: ${SSL_DOMAIN:-7gram.xyz}" https://localhost/health && echo "HTTPS ✅"
+    curl -skf -H "Host: ${domain}" "https://${bind_ip}/health" && echo "HTTPS ✅ (${bind_ip})"
     echo "cert:"
-    echo | openssl s_client -connect localhost:443 -servername "${SSL_DOMAIN:-7gram.xyz}" 2>/dev/null \
+    echo | openssl s_client -connect "${bind_ip}:443" -servername "${domain}" 2>/dev/null \
         | openssl x509 -noout -subject -issuer -enddate
 }
 

@@ -9,6 +9,12 @@
 package_update: true
 package_upgrade: true
 
+# The provision workflow SSHes as root (key injected via the Linode API) to
+# watch cloud-init and run the tailscale join — don't let cloud-init's Ubuntu
+# default (disable_root: true) break that.
+disable_root: false
+ssh_pwauth: false
+
 packages:
   - curl
   - ca-certificates
@@ -34,8 +40,11 @@ users:
       - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIISPnlFyF55VSInQ2MTULrBgwwKrSJfIpqiU9y9jtgTb jordan@desktop
 
 write_files:
-  # Same hardening directives as freddy's drop-in (renamed for princess)
-  - path: /etc/ssh/sshd_config.d/99-princess-hardening.conf
+  # Same hardening directives as freddy's drop-in. Named 00- (not 99-) because
+  # sshd honours the FIRST occurrence of each keyword across sshd_config.d and
+  # Ubuntu ships 60-cloudimg-settings.conf with PasswordAuthentication yes —
+  # this file must sort before it to win.
+  - path: /etc/ssh/sshd_config.d/00-princess-hardening.conf
     permissions: "0644"
     content: |
       # Princess Server SSH Hardening
@@ -77,9 +86,25 @@ write_files:
     content: |
       [sshd]
       enabled = true
+      # journald, not /var/log/auth.log — minimal cloud images ship no rsyslog
+      backend = systemd
       maxretry = 5
       bantime = 3600
       findtime = 600
+
+  # Order docker after tailscaled so the nginx container's BIND_IP (the
+  # tailscale 100.x address) exists at daemon-boot container restore. The wait
+  # is best-effort (always exits 0) — ip_nonlocal_bind below is the hard
+  # guarantee that the bind succeeds regardless.
+  - path: /etc/systemd/system/docker.service.d/wait-tailscale.conf
+    permissions: "0644"
+    content: |
+      [Unit]
+      After=tailscaled.service
+      Wants=tailscaled.service
+
+      [Service]
+      ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do tailscale ip -4 >/dev/null 2>&1 && exit 0; sleep 2; done; exit 0'
 
 runcmd:
   # Docker CE (official convenience script uses the same download.docker.com repo)
@@ -100,9 +125,11 @@ runcmd:
   # Tailscale — installed but NOT joined (manual `tailscale up`, same as
   # freddy/sullivan; the OAuth secrets are only for ephemeral CI runners)
   - curl -fsSL https://tailscale.com/install.sh | sh
-  # IP forwarding so this node can be a Tailscale exit node / subnet router
-  - printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' > /etc/sysctl.d/99-tailscale.conf
+  # IP forwarding for exit-node duty + nonlocal bind so docker can publish
+  # ports on the tailscale IP even before tailscale0 is up (reboot race)
+  - printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\nnet.ipv4.ip_nonlocal_bind = 1\n' > /etc/sysctl.d/99-tailscale.conf
   - sysctl -p /etc/sysctl.d/99-tailscale.conf
+  - systemctl daemon-reload
   - systemctl restart ssh
   - touch /var/lib/cloud/princess-bootstrap-done
 

@@ -76,11 +76,13 @@ jobs:
                   umask 077
                   echo "$SSH_KEY" > /tmp/actions_key
                   echo "$ROOT_SSH_KEY" > /tmp/root_key
-                  ACTIONS_PUB=$(ssh-keygen -y -f /tmp/actions_key)
-                  ROOT_PUB=$(ssh-keygen -y -f /tmp/root_key)
+                  # awk strips the key comment — a comment containing '#' or '|'
+                  # would corrupt the sed/YAML substitution downstream
+                  ACTIONS_PUB=$(ssh-keygen -y -f /tmp/actions_key | awk '{print $1, $2}')
+                  ROOT_PUB=$(ssh-keygen -y -f /tmp/root_key | awk '{print $1, $2}')
                   echo "actions_pub=$ACTIONS_PUB" >> "$GITHUB_OUTPUT"
                   echo "root_pub=$ROOT_PUB" >> "$GITHUB_OUTPUT"
-                  rm -f /tmp/actions_key
+                  rm -f /tmp/actions_key /tmp/root_key
 
             - name: 📄 Render cloud-init user data
               id: userdata
