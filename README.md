@@ -33,16 +33,21 @@ also advertises as a Tailscale **exit node**.
 
 ## How it deploys (same pattern as freddy/sullivan)
 
-- **`.github/workflows/provision.yml`** — one-time: creates the Linode via the
-  API (`ca-central` / `g6-nanode-1` / `linode/ubuntu26.04`) with cloud-init
-  bootstrap (`actions` + `jordan` users, sshd hardening, Docker, UFW,
-  fail2ban), then **joins the tailnet automatically** using the Tailscale
-  OAuth client secret as an auth key (tag-owned node — no key expiry, no
-  browser step). Idempotent.
+- **`.github/workflows/provision.yml`** — one-time, idempotent: checks Linode
+  for an existing `princess` first; otherwise creates it (`ca-central` /
+  `g6-nanode-1` / `linode/ubuntu26.04`, root password from the
+  `ROOT_PASSWORD` secret so Lish access always works), bootstraps via
+  cloud-init (users, sshd hardening, Docker, UFW, fail2ban), **joins the
+  tailnet automatically** (OAuth client secret as auth key — tag-owned, no
+  key expiry, no browser step), and **generates the permanent SSH keypairs on
+  the server**. Needs no SSH secrets to run — a run-ephemeral key bootstraps
+  root and is revoked at the end. You then copy the two generated keys into
+  the `SSH_KEY` / `ROOT_SSH_KEY` secrets (one-liners in the run summary).
 - **`.github/workflows/ci-cd.yml`** — on push: the runner joins the tailnet
-  (ephemeral `tag:ci` node), renews the wildcard Let's Encrypt cert when <30
-  days remain (Cloudflare DNS-01, shipped into the `ssl-certs` Docker volume),
-  git-pulls the repo on the server, and `docker compose up`s nginx.
+  (ephemeral `tag:ci` node), **discovers princess by hostname** (no IP secret
+  needed), renews the wildcard Let's Encrypt cert when <30 days remain
+  (Cloudflare DNS-01, shipped into the `ssl-certs` Docker volume), git-pulls
+  the repo on the server, and `docker compose up`s nginx.
   **DNS cutover is never automatic** — dispatch the workflow with
   `update_dns=true` when ready (see [docs/CUTOVER.md](docs/CUTOVER.md)).
 
@@ -85,3 +90,17 @@ run.sh                        setup-env | start | stop | logs | status | health
   dropped); on freddy the dashboard block silently absorbed them.
 - Backend IPs are env-driven (`FREDDY_TAILSCALE_IP` / `SULLIVAN_TAILSCALE_IP`
   in `.env`); the container entrypoint rewrites the nginx maps at startup.
+
+## The only manual steps
+
+After the provision workflow finishes (commands with the real IP are in its
+run summary):
+
+```bash
+ssh root@<public-ip> 'cat /home/actions/.ssh/id_ed25519' | gh secret set SSH_KEY -R nuniesmith/princess
+ssh root@<public-ip> 'cat /root/.ssh/id_ed25519'         | gh secret set ROOT_SSH_KEY -R nuniesmith/princess
+```
+
+…and approve the exit node in the Tailscale admin console. That's it — the
+deploy workflow finds princess on the tailnet by itself, so
+`PRINCESS_TAILSCALE_IP` never has to be set (it's an optional override).

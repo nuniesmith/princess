@@ -1,15 +1,22 @@
 name: 👑 Provision Princess (Linode)
 
-# One-time (idempotent) provisioning of the princess edge server:
-# a $5/mo Nanode in Toronto running Ubuntu 26.04 LTS, bootstrapped by
-# cloud-init (provision/cloud-init.yaml). Safe to re-run — if a Linode
-# labelled "princess" already exists it just reports its IP.
+# Idempotent provisioning, in the order that matters:
+#   1. Linode API: does a server labelled "princess" exist? yes → report, done.
+#   2. No → create it (root_pass = ROOT_PASSWORD secret, so you always have
+#      Lish/console access), wait for it to boot.
+#   3. Root SSH via a RUN-EPHEMERAL keypair (generated on this runner, injected
+#      at create, removed from the server at the end — no pre-existing SSH
+#      secrets required).
+#   4. Wait out cloud-init (system update, users, docker, ufw, tailscale
+#      install), then join the tailnet (OAuth client secret as auth key) and
+#      GENERATE THE PERMANENT SSH KEYPAIRS ON THE SERVER (root + actions).
+#   5. You then log in and copy the two private keys into the GitHub secrets:
+#        ROOT_SSH_KEY ← /root/.ssh/id_ed25519
+#        SSH_KEY      ← /home/actions/.ssh/id_ed25519
+#      (Private keys are never printed to workflow logs — this repo is public.)
 #
-# The Tailscale join is AUTOMATED: the OAuth client secret is used directly
-# as an auth key (tailscale.com/kb/1215 — requires the client to have the
-# auth_keys scope; the node comes up tag-owned, so no key expiry). The only
-# step left for you is updating the PRINCESS_TAILSCALE_IP repo secret with the
-# IP this workflow prints. See docs/PROVISIONING.md.
+# The deploy workflow discovers princess's tailscale IP from the tailnet, so
+# PRINCESS_TAILSCALE_IP is only an optional override.
 
 on:
     workflow_dispatch:
@@ -49,6 +56,7 @@ jobs:
             - name: 📥 Checkout
               uses: actions/checkout@v4
 
+            # ── 1. Linode first: anything already running? ──────────────────
             - name: 🔎 Check for existing instance
               id: existing
               env:
@@ -61,57 +69,54 @@ jobs:
                   if [ -n "$IP" ]; then
                     echo "exists=true" >> "$GITHUB_OUTPUT"
                     echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
-                    echo "::notice::Linode '$INSTANCE_LABEL' already exists at $IP — skipping create"
+                    echo "::notice::Linode '$INSTANCE_LABEL' already exists at $IP — nothing to create"
                   else
                     echo "exists=false" >> "$GITHUB_OUTPUT"
                   fi
 
-            - name: 🔑 Derive public keys from SSH secrets
-              id: keys
+            - name: 🧪 Preflight secrets
               if: steps.existing.outputs.exists == 'false'
               env:
-                  SSH_KEY: ${{ secrets.SSH_KEY }}
-                  ROOT_SSH_KEY: ${{ secrets.ROOT_SSH_KEY }}
+                  ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
+                  TS_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
               run: |
-                  umask 077
-                  echo "$SSH_KEY" > /tmp/actions_key
-                  echo "$ROOT_SSH_KEY" > /tmp/root_key
-                  # awk strips the key comment — a comment containing '#' or '|'
-                  # would corrupt the sed/YAML substitution downstream
-                  ACTIONS_PUB=$(ssh-keygen -y -f /tmp/actions_key | awk '{print $1, $2}')
-                  ROOT_PUB=$(ssh-keygen -y -f /tmp/root_key | awk '{print $1, $2}')
-                  echo "actions_pub=$ACTIONS_PUB" >> "$GITHUB_OUTPUT"
-                  echo "root_pub=$ROOT_PUB" >> "$GITHUB_OUTPUT"
-                  rm -f /tmp/actions_key /tmp/root_key
+                  if [ -z "$ROOT_PASSWORD" ]; then
+                    echo "::error::ROOT_PASSWORD secret is empty — set a strong root password (used for the Linode create; gives you Lish console access)"
+                    exit 1
+                  fi
+                  if [ ${#ROOT_PASSWORD} -lt 12 ]; then
+                    echo "::error::ROOT_PASSWORD is too short — Linode enforces a strength check; use 12+ mixed characters"
+                    exit 1
+                  fi
+                  if [ -z "$TS_SECRET" ]; then
+                    echo "::error::TAILSCALE_OAUTH_SECRET secret is empty — needed to join the tailnet"
+                    exit 1
+                  fi
 
-            - name: 📄 Render cloud-init user data
-              id: userdata
+            # ── 2/3. Create with an ephemeral root key for this run only ────
+            - name: 🔑 Generate run-ephemeral root key
+              id: ephemeral
               if: steps.existing.outputs.exists == 'false'
               run: |
-                  sed "s|__ACTIONS_PUBKEY__|${{ steps.keys.outputs.actions_pub }}|" \
-                    provision/cloud-init.yaml > /tmp/cloud-init.rendered.yaml
-                  if grep -q '__ACTIONS_PUBKEY__' /tmp/cloud-init.rendered.yaml; then
-                    echo "::error::cloud-init placeholder substitution failed"; exit 1
-                  fi
-                  echo "b64=$(base64 -w0 /tmp/cloud-init.rendered.yaml)" >> "$GITHUB_OUTPUT"
+                  umask 077
+                  ssh-keygen -t ed25519 -N "" -C "princess-provision-ephemeral" -f /tmp/ephemeral_key >/dev/null
+                  echo "pub=$(cat /tmp/ephemeral_key.pub)" >> "$GITHUB_OUTPUT"
 
             - name: 🏗️ Create Linode instance
               id: create
               if: steps.existing.outputs.exists == 'false'
               env:
                   LINODE_API_KEY: ${{ secrets.LINODE_API_KEY }}
+                  ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
               run: |
-                  # Root password is required by the API but never used (SSH keys
-                  # only, PasswordAuthentication off) — random and discarded.
-                  ROOT_PASS=$(openssl rand -base64 32)
                   BODY=$(jq -n \
                     --arg label "$INSTANCE_LABEL" \
                     --arg region "${{ inputs.region }}" \
                     --arg type "${{ inputs.instance_type }}" \
                     --arg image "${{ inputs.image }}" \
-                    --arg root_pass "$ROOT_PASS" \
-                    --arg key "${{ steps.keys.outputs.root_pub }}" \
-                    --arg user_data "${{ steps.userdata.outputs.b64 }}" \
+                    --arg root_pass "$ROOT_PASSWORD" \
+                    --arg key "${{ steps.ephemeral.outputs.pub }}" \
+                    --arg user_data "$(base64 -w0 provision/cloud-init.yaml)" \
                     '{label: $label, region: $region, type: $type, image: $image,
                       root_pass: $root_pass, authorized_keys: [$key], booted: true,
                       tags: ["princess", "edge"],
@@ -119,7 +124,7 @@ jobs:
                   RESP=$(curl -sf -X POST "https://api.linode.com/v4/linode/instances" \
                     -H "Authorization: Bearer $LINODE_API_KEY" \
                     -H "Content-Type: application/json" \
-                    --data "$BODY") || { echo "::error::Linode create failed"; exit 1; }
+                    --data "$BODY") || { echo "::error::Linode create failed (check LINODE_API_KEY and ROOT_PASSWORD strength)"; exit 1; }
                   echo "id=$(echo "$RESP" | jq -r .id)" >> "$GITHUB_OUTPUT"
                   echo "public_ip=$(echo "$RESP" | jq -r '.ipv4[0]')" >> "$GITHUB_OUTPUT"
 
@@ -137,40 +142,29 @@ jobs:
                   done
                   echo "::error::instance did not reach 'running' in 10 minutes"; exit 1
 
+            # ── 4. SSH in as root, wait out cloud-init ──────────────────────
             - name: ⏳ Wait for cloud-init to finish
               if: steps.existing.outputs.exists == 'false'
-              continue-on-error: true
-              env:
-                  ROOT_SSH_KEY: ${{ secrets.ROOT_SSH_KEY }}
               run: |
-                  umask 077
-                  mkdir -p ~/.ssh
-                  echo "$ROOT_SSH_KEY" > ~/.ssh/root_key
                   IP="${{ steps.create.outputs.public_ip }}"
-                  # SSH comes up before cloud-init finishes; retry until reachable
                   for i in $(seq 1 30); do
-                    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/root_key \
+                    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i /tmp/ephemeral_key \
                         root@"$IP" "cloud-init status --wait" 2>/dev/null; then
                       echo "✅ cloud-init complete"
-                      rm -f ~/.ssh/root_key
                       exit 0
                     fi
                     echo "waiting for SSH... (attempt $i)"
                     sleep 20
                   done
-                  rm -f ~/.ssh/root_key
-                  echo "::warning::could not confirm cloud-init completion — check manually"
+                  echo "::error::could not reach the server / cloud-init did not finish — check Lish console"
+                  exit 1
 
-            - name: 🔗 Join Tailscale (OAuth secret as auth key)
-              id: tailscale-join
+            - name: 🔗 Join Tailscale + generate server-side SSH keys
+              id: bootstrap
               if: steps.existing.outputs.exists == 'false'
               env:
-                  ROOT_SSH_KEY: ${{ secrets.ROOT_SSH_KEY }}
                   TS_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
               run: |
-                  umask 077
-                  mkdir -p ~/.ssh
-                  echo "$ROOT_SSH_KEY" > ~/.ssh/root_key
                   IP="${{ steps.create.outputs.public_ip }}"
 
                   EXIT_FLAG=""
@@ -178,18 +172,33 @@ jobs:
                     EXIT_FLAG="--advertise-exit-node"
                   fi
 
-                  # OAuth client secret used directly as an auth key
-                  # (tailscale.com/kb/1215): node is created tag-owned (no key
-                  # expiry), non-ephemeral, preauthorized.
-                  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i ~/.ssh/root_key root@"$IP" \
+                  # Join the tailnet: OAuth client secret used directly as an
+                  # auth key (tailscale.com/kb/1215) — node is tag-owned (no
+                  # key expiry), non-ephemeral, preauthorized.
+                  ssh -o StrictHostKeyChecking=no -i /tmp/ephemeral_key root@"$IP" \
                     "tailscale up \
                        --auth-key='${TS_OAUTH_SECRET}?ephemeral=false&preauthorized=true' \
                        --advertise-tags='${{ inputs.tailscale_tag }}' \
                        --hostname=princess \
                        --accept-routes $EXIT_FLAG"
 
-                  TS_IP=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/root_key root@"$IP" "tailscale ip -4 | head -1")
-                  rm -f ~/.ssh/root_key
+                  # Generate the PERMANENT keypairs ON the server (they never
+                  # appear in these logs); enable them for their users.
+                  ssh -o StrictHostKeyChecking=no -i /tmp/ephemeral_key root@"$IP" 'bash -s' <<'EOSH'
+                  set -e
+                  [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -C "princess-root" -f /root/.ssh/id_ed25519 >/dev/null
+                  grep -qf /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys 2>/dev/null || cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
+                  chmod 600 /root/.ssh/authorized_keys
+
+                  install -d -m 700 -o actions -g actions /home/actions/.ssh
+                  [ -f /home/actions/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -C "princess-actions" -f /home/actions/.ssh/id_ed25519 >/dev/null
+                  grep -qf /home/actions/.ssh/id_ed25519.pub /home/actions/.ssh/authorized_keys 2>/dev/null || cat /home/actions/.ssh/id_ed25519.pub >> /home/actions/.ssh/authorized_keys
+                  chown -R actions:actions /home/actions/.ssh
+                  chmod 600 /home/actions/.ssh/id_ed25519 /home/actions/.ssh/authorized_keys
+                  echo "server-side keys ready"
+                  EOSH
+
+                  TS_IP=$(ssh -o StrictHostKeyChecking=no -i /tmp/ephemeral_key root@"$IP" "tailscale ip -4 | head -1")
                   if [ -z "$TS_IP" ]; then
                     echo "::error::tailscale join appeared to succeed but no IPv4 was assigned"
                     exit 1
@@ -197,29 +206,43 @@ jobs:
                   echo "ts_ip=$TS_IP" >> "$GITHUB_OUTPUT"
                   echo "::notice::princess joined the tailnet as $TS_IP"
 
+                  # Last act: revoke this run's ephemeral key from the server.
+                  ssh -o StrictHostKeyChecking=no -i /tmp/ephemeral_key root@"$IP" \
+                    "sed -i '/princess-provision-ephemeral/d' /root/.ssh/authorized_keys"
+
+            - name: 🧹 Cleanup runner key material
+              if: always()
+              run: rm -f /tmp/ephemeral_key /tmp/ephemeral_key.pub
+
             - name: 📋 Summary
               if: always()
               run: |
                   IP="${{ steps.existing.outputs.public_ip || steps.create.outputs.public_ip }}"
-                  TS_IP="${{ steps.tailscale-join.outputs.ts_ip }}"
+                  TS_IP="${{ steps.bootstrap.outputs.ts_ip }}"
                   {
                     echo "## 👑 Princess provisioning"
                     echo ""
                     echo "| | |"
                     echo "|---|---|"
-                    echo "| Public IP | \`$IP\` (dark — nothing binds here) |"
-                    echo "| Tailscale IP | \`${TS_IP:-join skipped/failed}\` |"
+                    echo "| Public IP | \`$IP\` (SSH only — nothing else binds here) |"
+                    echo "| Tailscale IP | \`${TS_IP:-n/a (existing instance or join failed)}\` |"
                     echo "| Region | ${{ inputs.region }} |"
                     echo "| Type | ${{ inputs.instance_type }} (\$5/mo) |"
                     echo "| Image | ${{ inputs.image }} |"
                     echo ""
-                    echo "### Next steps"
-                    echo "1. Update the \`PRINCESS_TAILSCALE_IP\` repo secret to \`${TS_IP:-<tailscale ip -4>}\`"
+                    echo "### Fetch the two generated secrets (from your desktop)"
+                    echo '```bash'
+                    echo "ssh root@$IP 'cat /root/.ssh/id_ed25519' | gh secret set ROOT_SSH_KEY -R ${{ github.repository }}"
+                    echo "ssh root@$IP 'cat /home/actions/.ssh/id_ed25519' | gh secret set SSH_KEY -R ${{ github.repository }}"
+                    echo '```'
+                    echo "(root SSH works with your desktop key; Lish + ROOT_PASSWORD is the backup path)"
+                    echo ""
+                    echo "### Then"
                     if [ "${{ inputs.advertise_exit_node }}" = "true" ]; then
-                      echo "2. Approve the **exit node** in the Tailscale admin console (Machines → princess → Edit route settings)"
+                      echo "- Approve the **exit node** in the Tailscale admin console (Machines → princess → Edit route settings)"
                     fi
-                    echo "3. Run the **👑 Princess Deploy** workflow (or push to main)"
-                    echo "4. Optional hardening: close public SSH once the tailnet path works — \`ufw delete allow 22/tcp\`"
+                    echo "- Run the **👑 Princess Deploy** workflow (or push to main) — it finds princess on the tailnet by itself"
+                    echo "- Optional: \`PRINCESS_TAILSCALE_IP=${TS_IP:-<ip>}\` as an override secret; optional hardening: \`ufw delete allow 22/tcp\` on the server"
                   } >> "$GITHUB_STEP_SUMMARY"
 
             - name: 📣 Notify
@@ -235,6 +258,6 @@ jobs:
                   fields: |
                       [
                         {"name": "Public IP", "value": "${{ steps.existing.outputs.public_ip || steps.create.outputs.public_ip || 'n/a' }}", "inline": true},
-                        {"name": "Region", "value": "${{ inputs.region }}", "inline": true},
+                        {"name": "Tailscale IP", "value": "${{ steps.bootstrap.outputs.ts_ip || 'n/a' }}", "inline": true},
                         {"name": "Existed", "value": "${{ steps.existing.outputs.exists }}", "inline": true}
                       ]

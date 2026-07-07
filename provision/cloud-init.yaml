@@ -1,17 +1,15 @@
 #cloud-config
-# princess bootstrap — mirrors freddy/sullivan's setup-prod-server.sh, adapted
-# for a public Linode. Rendered by .github/workflows/provision.yml, which
-# replaces __ACTIONS_PUBKEY__ with the public key derived from the SSH_KEY
-# secret. Linode requires this base64-encoded in metadata.user_data (max 64KB)
-# and it CANNOT be changed after create — keep this bootstrap-only; everything
-# else deploys via GitHub Actions over SSH.
+# princess bootstrap — static config, no secrets, no placeholders (safe to
+# store in immutable Linode user_data). Secrets-dependent steps (tailscale
+# join) and server-side SSH key generation happen afterwards over SSH from
+# the provision workflow. Max 64KB base64; cannot be changed after create.
 
 package_update: true
 package_upgrade: true
 
-# The provision workflow SSHes as root (key injected via the Linode API) to
-# watch cloud-init and run the tailscale join — don't let cloud-init's Ubuntu
-# default (disable_root: true) break that.
+# The provision workflow SSHes as root using a run-ephemeral key injected via
+# the Linode API — don't let cloud-init's Ubuntu default (disable_root: true)
+# rewrite root's authorized_keys.
 disable_root: false
 ssh_pwauth: false
 
@@ -23,13 +21,13 @@ packages:
   - git
 
 users:
-  # CI/CD user (SSH-key-only; added to docker group in runcmd once docker exists)
+  # CI/CD user. Its SSH keypair is GENERATED ON THIS SERVER by the provision
+  # workflow; you then copy /home/actions/.ssh/id_ed25519 into the SSH_KEY
+  # GitHub secret. Password locked, docker group added in runcmd.
   - name: actions
     gecos: GitHub Actions CI/CD User
     shell: /bin/bash
     lock_passwd: true
-    ssh_authorized_keys:
-      - __ACTIONS_PUBKEY__
   # Interactive admin user
   - name: jordan
     gecos: Jordan
@@ -107,6 +105,11 @@ write_files:
       ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do tailscale ip -4 >/dev/null 2>&1 && exit 0; sleep 2; done; exit 0'
 
 runcmd:
+  # Jordan's desktop key also works for root (PermitRootLogin prohibit-password
+  # = key-only). ROOT_PASSWORD from the Linode create remains usable via Lish.
+  - install -d -m 700 /root/.ssh
+  - echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIISPnlFyF55VSInQ2MTULrBgwwKrSJfIpqiU9y9jtgTb jordan@desktop' >> /root/.ssh/authorized_keys
+  - chmod 600 /root/.ssh/authorized_keys
   # Docker CE (official convenience script uses the same download.docker.com repo)
   - curl -fsSL https://get.docker.com | sh
   - usermod -aG docker actions
@@ -115,15 +118,15 @@ runcmd:
   # tailscale IP (BIND_IP in .env), because Docker-published ports bypass UFW;
   # the bind address, not the firewall, is what keeps the public IP dark.
   # 22 stays open (key-only + fail2ban) as the bootstrap/rescue path; close it
-  # after the tailnet join if you want (docs/PROVISIONING.md §5).
+  # after the tailnet join if you want (docs/PROVISIONING.md).
   - ufw default deny incoming
   - ufw default allow outgoing
   - ufw allow 22/tcp
   - ufw allow in on tailscale0
   - ufw --force enable
   - systemctl enable --now fail2ban
-  # Tailscale — installed but NOT joined (manual `tailscale up`, same as
-  # freddy/sullivan; the OAuth secrets are only for ephemeral CI runners)
+  # Tailscale — installed here; JOINED by the provision workflow over SSH
+  # (the auth key is a secret and user_data is immutable + API-readable)
   - curl -fsSL https://tailscale.com/install.sh | sh
   # IP forwarding for exit-node duty + nonlocal bind so docker can publish
   # ports on the tailscale IP even before tailscale0 is up (reboot race)

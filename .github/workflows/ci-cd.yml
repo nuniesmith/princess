@@ -59,6 +59,37 @@ jobs:
         runs-on: ubuntu-latest
         if: github.event_name == 'workflow_dispatch' && inputs.update_dns
         steps:
+            - name: 🔌 Connect to Tailscale
+              id: tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+
+            - name: 🎯 Resolve princess's tailnet IP
+              id: target
+              env:
+                  OVERRIDE: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+              run: |
+                  IP=""
+                  case "$OVERRIDE" in
+                    100.*) IP="$OVERRIDE" ;;
+                  esac
+                  if [ -z "$IP" ]; then
+                    IP=$(tailscale ip -4 princess 2>/dev/null | head -1) || true
+                  fi
+                  if [ -z "$IP" ]; then
+                    IP=$(tailscale status --json 2>/dev/null \
+                      | jq -r '.Peer[]? | select(.HostName == "princess") | .TailscaleIPs[]?' \
+                      | grep '^100\.' | head -1) || true
+                  fi
+                  if [ -z "$IP" ]; then
+                    echo "::error::princess is not on the tailnet — provision it before cutting DNS over"
+                    exit 1
+                  fi
+                  echo "ip=$IP" >> "$GITHUB_OUTPUT"
+                  echo "::notice::DNS will point at $IP"
+
             - name: 🌐 Update DNS records (apex + wildcard → princess tailnet IP)
               id: dns-princess
               uses: nuniesmith/actions/.github/actions/cloudflare-dns-update@main
@@ -70,13 +101,13 @@ jobs:
                   # 100.x Tailscale IP, so only devices logged into the tailnet
                   # can reach any service. proxied MUST stay false — Cloudflare
                   # cannot reach CGNAT addresses.
-                  record-content: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+                  record-content: ${{ steps.target.outputs.ip }}
                   record-type: A
                   ttl: "1"
                   proxied: "false"
                   additional-records: |
                       [
-                        {"name": "*.7gram.xyz", "content": "${{ secrets.PRINCESS_TAILSCALE_IP }}"}
+                        {"name": "*.7gram.xyz", "content": "${{ steps.target.outputs.ip }}"}
                       ]
 
     # ==========================================================================
@@ -102,27 +133,61 @@ jobs:
               with:
                   oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
                   oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
-                  target-ip: ${{ secrets.PRINCESS_TAILSCALE_IP }}
-                  target-ssh-port: ${{ secrets.SSH_PORT || '22' }}
 
-            - name: 🧪 Preflight — target sanity
+            - name: 🎯 Locate princess on the tailnet
+              id: target
               env:
-                  TARGET: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+                  OVERRIDE: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+                  SSH_KEY: ${{ secrets.SSH_KEY }}
               run: |
                   if [ "${{ steps.tailscale.outputs.connected }}" != "true" ]; then
                     echo "::error::Runner failed to join the tailnet — check TAILSCALE_OAUTH_CLIENT_ID/SECRET (needs auth_keys scope, tag:ci)"
                     exit 1
                   fi
-                  case "$TARGET" in
-                    100.*) : ;;
-                    *)
-                      echo "::error::PRINCESS_TAILSCALE_IP secret is not a Tailscale IP (expected 100.x.y.z). If princess isn't provisioned yet, run the '👑 Provision Princess (Linode)' workflow first, then set this secret to the IP it prints."
-                      exit 1 ;;
+
+                  # Optional override; anything that isn't a 100.x address
+                  # (e.g. a placeholder) is ignored and we discover instead.
+                  IP=""
+                  case "$OVERRIDE" in
+                    100.*) IP="$OVERRIDE"; echo "using PRINCESS_TAILSCALE_IP override: $IP" ;;
                   esac
-                  if [ "${{ steps.tailscale.outputs.ssh-reachable }}" != "true" ]; then
-                    echo "::error::Cannot reach $TARGET:${{ secrets.SSH_PORT || '22' }} over the tailnet. Is the server up and joined (provision workflow), and does the ACL allow tag:ci -> princess:22?"
+
+                  if [ -z "$IP" ]; then
+                    IP=$(tailscale ip -4 princess 2>/dev/null | head -1) || true
+                  fi
+                  if [ -z "$IP" ]; then
+                    IP=$(tailscale status --json 2>/dev/null \
+                      | jq -r '.Peer[]? | select(.HostName == "princess") | .TailscaleIPs[]?' \
+                      | grep '^100\.' | head -1) || true
+                  fi
+                  if [ -z "$IP" ]; then
+                    echo "::error::princess is not on the tailnet. Run the '👑 Provision Princess (Linode)' workflow first — it creates the server and joins it automatically."
                     exit 1
                   fi
+
+                  # SSH_KEY must be the actions user's key generated on the
+                  # server during provisioning.
+                  umask 077
+                  echo "$SSH_KEY" > /tmp/ssh_key_check
+                  if ! ssh-keygen -y -f /tmp/ssh_key_check >/dev/null 2>&1; then
+                    rm -f /tmp/ssh_key_check
+                    echo "::error::SSH_KEY secret is not a valid private key. After provisioning: ssh root@<public-ip> 'cat /home/actions/.ssh/id_ed25519' | gh secret set SSH_KEY -R ${{ github.repository }}"
+                    exit 1
+                  fi
+                  rm -f /tmp/ssh_key_check
+
+                  PORT="${{ secrets.SSH_PORT || '22' }}"
+                  for i in $(seq 1 12); do
+                    nc -z -w5 "$IP" "$PORT" 2>/dev/null && break
+                    echo "waiting for $IP:$PORT... (attempt $i)"
+                    sleep 5
+                  done
+                  if ! nc -z -w5 "$IP" "$PORT" 2>/dev/null; then
+                    echo "::error::Cannot reach $IP:$PORT over the tailnet — is the server up, and does the ACL allow tag:ci -> princess:22?"
+                    exit 1
+                  fi
+                  echo "ip=$IP" >> "$GITHUB_OUTPUT"
+                  echo "::notice::deploy target: $IP"
 
             - name: 🔍 Check SSL certificate status
               id: check-certs
@@ -139,7 +204,7 @@ jobs:
                   # landed in the volume — never let that state persist).
                   NEEDS_RENEWAL=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa \
                     -p ${{ secrets.SSH_PORT || '22' }} \
-                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.PRINCESS_TAILSCALE_IP }} \
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ steps.target.outputs.ip }} \
                     "docker volume inspect ssl-certs >/dev/null 2>&1 && \
                      docker run --rm -v ssl-certs:/certs alpine sh -c \
                        'apk add --no-cache openssl >/dev/null 2>&1 && \
@@ -182,10 +247,10 @@ jobs:
 
                   scp -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -P ${{ secrets.SSH_PORT || '22' }} \
                     /tmp/ssl-certs.tar.gz \
-                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.PRINCESS_TAILSCALE_IP }}:/tmp/ssl-certs.tar.gz
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ steps.target.outputs.ip }}:/tmp/ssl-certs.tar.gz
 
                   ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p ${{ secrets.SSH_PORT || '22' }} \
-                    ${{ secrets.SSH_USER || 'actions' }}@${{ secrets.PRINCESS_TAILSCALE_IP }} << 'ENDSSH'
+                    ${{ secrets.SSH_USER || 'actions' }}@${{ steps.target.outputs.ip }} << 'ENDSSH'
                   docker volume inspect ssl-certs >/dev/null 2>&1 || docker volume create ssl-certs
                   docker run --rm -v ssl-certs:/certs -v /tmp:/tmp busybox \
                     sh -c "cd /certs && tar -xzf /tmp/ssl-certs.tar.gz && ls -la /certs/live/ && echo 'Certificates deployed successfully'"
@@ -199,7 +264,7 @@ jobs:
               if: steps.tailscale.outputs.connected == 'true'
               uses: nuniesmith/actions/.github/actions/ssh-deploy@main
               with:
-                  host: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+                  host: ${{ steps.target.outputs.ip }}
                   port: ${{ secrets.SSH_PORT || '22' }}
                   username: ${{ secrets.SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.SSH_KEY }}
@@ -253,7 +318,7 @@ jobs:
               with:
                   # Note: health-check action expects SPACE-separated container names
                   containers: nginx
-                  ssh-host: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+                  ssh-host: ${{ steps.target.outputs.ip }}
                   ssh-port: ${{ secrets.SSH_PORT || '22' }}
                   ssh-user: ${{ secrets.SSH_USER || 'actions' }}
                   ssh-key: ${{ secrets.SSH_KEY }}

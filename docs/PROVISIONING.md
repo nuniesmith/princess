@@ -3,74 +3,85 @@
 Verified against the Linode API, Tailscale docs, and the freddy/sullivan
 repos on 2026-07-06.
 
-## 0. Prerequisites (already done)
+## The order of operations
 
-All GitHub secrets are set on `nuniesmith/princess` — see
-[GITHUB_SECRETS.md](GITHUB_SECRETS.md). One thing to confirm in the
-[Tailscale admin console](https://login.tailscale.com/admin/settings/oauth):
-the OAuth client (the one in `TAILSCALE_OAUTH_CLIENT_ID/SECRET`) needs the
-**auth_keys** scope — it already has it if freddy/sullivan deploys work —
-because provisioning uses its secret directly as the server's auth key.
+```
+you: dispatch provision ──► Linode API: "princess" exists?
+                                 │no                 │yes → report IPs, done
+                                 ▼
+                          create instance (root_pass = ROOT_PASSWORD,
+                          run-ephemeral root key, cloud-init user_data)
+                                 ▼
+                          wait running → root SSH → cloud-init finishes
+                          (update+upgrade, users, sshd hardening, docker,
+                           ufw 22+tailscale0 only, fail2ban, tailscale pkg)
+                                 ▼
+                          tailscale up (OAuth secret as auth key,
+                          tag-owned → no key expiry, exit node)
+                                 ▼
+                          generate SSH keypairs ON the server
+                          (root + actions) → revoke ephemeral key
+                                 ▼
+you: copy the 2 generated keys into GH secrets (one-liner each)
+you: approve exit node in the Tailscale console
+you: dispatch deploy → done (it finds princess on the tailnet itself)
+```
 
-## 1. Create the server (fully automated)
+## 1. Dispatch the provision workflow
 
 GitHub → Actions → **👑 Provision Princess (Linode)** → Run workflow → type
-`princess` in the confirm box.
+`princess` in the confirm box. Prereqs are just `LINODE_API_KEY`,
+`ROOT_PASSWORD`, and the Tailscale OAuth secrets —
+**no SSH key secrets are needed to provision** (a run-ephemeral key handles
+the bootstrap and is removed from the server at the end).
 
-What it does:
+Instance: region `ca-central` (Toronto), type `g6-nanode-1` ($5/mo), image
+`linode/ubuntu26.04`. ⚠️ cloud-init `user_data` is immutable after create —
+bootstrap changes require a rebuild; everything else deploys over SSH.
 
-1. Skips creation if a Linode labelled `princess` already exists (idempotent).
-2. Derives the `actions` user's public key from the `SSH_KEY` secret and
-   renders it into `provision/cloud-init.yaml`.
-3. `POST /v4/linode/instances` — region `ca-central` (Toronto), type
-   `g6-nanode-1`, image `linode/ubuntu26.04`, root key from `ROOT_SSH_KEY`,
-   cloud-init as base64 `metadata.user_data`.
-   ⚠️ user_data is **immutable after create** — bootstrap changes require a
-   rebuild, which is why cloud-init stays minimal and everything else deploys
-   over SSH.
-4. Waits for `running`, SSHes as root, waits for `cloud-init status --wait`.
-5. **Joins the tailnet**: `tailscale up` with the OAuth client secret as auth
-   key (`?ephemeral=false&preauthorized=true`, `--advertise-tags=tag:ci`,
-   `--accept-routes`, `--advertise-exit-node` unless unchecked). Tag-owned
-   nodes have **no key expiry** — nothing to disable in the console.
-6. Prints the Tailscale IP in the run summary.
+## 2. Copy the two server-generated secrets (~1 minute)
 
-Cloud-init gives you: `actions` (CI, docker group) + `jordan` (sudo) users,
-hardened sshd (key-only, drop-in `99-princess-hardening.conf`), Docker CE with
-freddy's hardened `daemon.json`, UFW (**22 + tailscale0 only — no public
-80/443**), fail2ban, Tailscale installed, IP forwarding for exit-node duty.
+The run summary prints these with the real IP filled in:
 
-## 2. One manual minute
+```bash
+ssh root@<public-ip> 'cat /home/actions/.ssh/id_ed25519' | gh secret set SSH_KEY -R nuniesmith/princess
+ssh root@<public-ip> 'cat /root/.ssh/id_ed25519'         | gh secret set ROOT_SSH_KEY -R nuniesmith/princess
+```
 
-1. Update the **`PRINCESS_TAILSCALE_IP`** repo secret with the IP from the run
-   summary.
-2. If you left exit-node on: approve it in the admin console
-   (Machines → princess → Edit route settings → allow exit node).
-3. If your tailnet uses ACLs (not default allow-all), make sure:
-   - your devices → princess:443 (and :80),
-   - princess (its tag) → freddy/sullivan service ports,
-   - `tag:ci` → princess:22 (CI deploys over the tailnet).
+Root SSH works with your desktop key (cloud-init installs it for both `jordan`
+and `root`); Lish console + `ROOT_PASSWORD` is the backup path. The keys are
+generated on the server and never pass through workflow logs.
+
+Also: approve the **exit node** in the
+[Tailscale admin console](https://login.tailscale.com/admin/machines)
+(Machines → princess → Edit route settings). Tag-owned nodes have no key
+expiry — nothing to disable.
+
+If your tailnet uses ACLs (not default allow-all), ensure: your devices →
+princess:443/80; princess (its tag) → freddy/sullivan service ports;
+`tag:ci` → princess:22.
 
 ## 3. First deploy
 
-Push to `main` (or dispatch **👑 Princess Deploy**). The pipeline:
+Push to `main` or dispatch **👑 Princess Deploy**:
 
-1. Runner joins the tailnet as an ephemeral `tag:ci` node
-   (`tailscale-connect` composite, OAuth client).
-2. First run: no cert in the `ssl-certs` volume → generates the wildcard
-   Let's Encrypt cert (`7gram.xyz`, `*.7gram.xyz`, `*.sullivan.7gram.xyz`) via
-   Cloudflare DNS-01 on the runner, scps the tarball over, extracts it into
-   the volume.
-3. Clones the repo to `/home/actions/princess`, generates `.env` on the server
-   (`run.sh setup-env` auto-sets `BIND_IP` to the tailscale IP), builds and
-   starts nginx **bound to the tailscale IP** — the public IP stays dark.
+1. Runner joins the tailnet (ephemeral `tag:ci`) and **discovers princess by
+   hostname** — no IP secret required (`PRINCESS_TAILSCALE_IP` is an optional
+   override).
+2. First run: empty `ssl-certs` volume → wildcard Let's Encrypt cert
+   (`7gram.xyz`, `*.7gram.xyz`, `*.sullivan.7gram.xyz`) via Cloudflare DNS-01
+   on the runner, shipped into the volume. Renewed by the weekly cron when
+   <30 days remain (or if a non-LE cert is ever found).
+3. Repo cloned to `/home/actions/princess`, `.env` generated on the server
+   (`run.sh setup-env` auto-sets `BIND_IP` to the tailscale IP), nginx built
+   and started **bound to the tailscale IP** — the public IP stays dark.
 
 ## 4. Verify BEFORE touching DNS
 
-From a machine **on the tailnet** (nothing is reachable from outside it):
+From a machine **on the tailnet**:
 
 ```bash
-TS_IP=<princess tailscale ip>
+TS_IP=$(tailscale ip -4 princess)
 curl -s  --resolve 7gram.xyz:443:$TS_IP        https://7gram.xyz/health      # OK
 curl -sI --resolve nc.7gram.xyz:443:$TS_IP     https://nc.7gram.xyz/         # freddy
 curl -sI --resolve sonarr.7gram.xyz:443:$TS_IP https://sonarr.7gram.xyz/     # sullivan
@@ -85,7 +96,7 @@ curl -m 5 http://<public-ip>/   # should time out / refuse
 ## 5. DNS cutover
 
 See [CUTOVER.md](CUTOVER.md) — dispatch **👑 Princess Deploy** with
-`update_dns=true`; records move to princess's tailscale IP.
+`update_dns=true`; records move to princess's tailscale IP (auto-resolved).
 
 ## 6. Optional hardening
 
