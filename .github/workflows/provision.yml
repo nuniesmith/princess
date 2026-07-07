@@ -147,9 +147,12 @@ jobs:
               if: steps.existing.outputs.exists == 'false'
               run: |
                   IP="${{ steps.create.outputs.public_ip }}"
+                  # Exit 0 = done clean; exit 2 = done DEGRADED (recoverable
+                  # warnings — e.g. Linode's metadata service logs an IPv6
+                  # retry warning on every boot). Both mean "finished".
                   for i in $(seq 1 30); do
                     if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i /tmp/ephemeral_key \
-                        root@"$IP" "cloud-init status --wait" 2>/dev/null; then
+                        root@"$IP" "cloud-init status --wait >/dev/null 2>&1; rc=\$?; [ \$rc -eq 0 ] || [ \$rc -eq 2 ]" 2>/dev/null; then
                       echo "✅ cloud-init complete"
                       exit 0
                     fi
@@ -161,30 +164,54 @@ jobs:
 
             - name: 🔗 Join Tailscale + generate server-side SSH keys
               id: bootstrap
-              if: steps.existing.outputs.exists == 'false'
+              # Runs for a FRESH instance (ephemeral key) or an EXISTING one
+              # (ROOT_SSH_KEY secret) — so a run that died halfway, or a
+              # manually-created server, can always be completed by re-running.
+              if: steps.create.outcome == 'success' || steps.existing.outputs.exists == 'true'
               env:
                   TS_OAUTH_SECRET: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  ROOT_SSH_KEY: ${{ secrets.ROOT_SSH_KEY }}
               run: |
-                  IP="${{ steps.create.outputs.public_ip }}"
+                  umask 077
+                  if [ "${{ steps.existing.outputs.exists }}" = "true" ]; then
+                    IP="${{ steps.existing.outputs.public_ip }}"
+                    echo "$ROOT_SSH_KEY" > /tmp/boot_key
+                    if ! ssh-keygen -y -f /tmp/boot_key >/dev/null 2>&1; then
+                      echo "::error::Instance exists but ROOT_SSH_KEY secret is not a valid private key — cannot finish its bootstrap. Set it (ssh root@$IP 'cat /root/.ssh/id_ed25519' | gh secret set ROOT_SSH_KEY -R ${{ github.repository }}) or delete the Linode and re-run."
+                      exit 1
+                    fi
+                  else
+                    IP="${{ steps.create.outputs.public_ip }}"
+                    cp /tmp/ephemeral_key /tmp/boot_key
+                  fi
+
+                  SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i /tmp/boot_key root@$IP"
 
                   EXIT_FLAG=""
                   if [ "${{ inputs.advertise_exit_node }}" = "true" ]; then
                     EXIT_FLAG="--advertise-exit-node"
                   fi
 
-                  # Join the tailnet: OAuth client secret used directly as an
-                  # auth key (tailscale.com/kb/1215) — node is tag-owned (no
-                  # key expiry), non-ephemeral, preauthorized.
-                  ssh -o StrictHostKeyChecking=no -i /tmp/ephemeral_key root@"$IP" \
-                    "tailscale up \
-                       --auth-key='${TS_OAUTH_SECRET}?ephemeral=false&preauthorized=true' \
-                       --advertise-tags='${{ inputs.tailscale_tag }}' \
-                       --hostname=princess \
-                       --accept-routes $EXIT_FLAG"
+                  # Join the tailnet (skipped if already joined): OAuth client
+                  # secret used directly as an auth key (tailscale.com/kb/1215)
+                  # — node is tag-owned (no key expiry), non-ephemeral,
+                  # preauthorized.
+                  TS_IP=$($SSH "tailscale ip -4 2>/dev/null | head -1") || true
+                  if [ -n "$TS_IP" ]; then
+                    echo "already on the tailnet as $TS_IP — skipping join"
+                  else
+                    $SSH \
+                      "tailscale up \
+                         --auth-key='${TS_OAUTH_SECRET}?ephemeral=false&preauthorized=true' \
+                         --advertise-tags='${{ inputs.tailscale_tag }}' \
+                         --hostname=princess \
+                         --accept-routes $EXIT_FLAG"
+                  fi
 
-                  # Generate the PERMANENT keypairs ON the server (they never
-                  # appear in these logs); enable them for their users.
-                  ssh -o StrictHostKeyChecking=no -i /tmp/ephemeral_key root@"$IP" 'bash -s' <<'EOSH'
+                  # Generate the PERMANENT keypairs ON the server if missing
+                  # (they never appear in these logs); enable them for their
+                  # users. Idempotent.
+                  $SSH 'bash -s' <<'EOSH'
                   set -e
                   [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -C "princess-root" -f /root/.ssh/id_ed25519 >/dev/null
                   grep -qf /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys 2>/dev/null || cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
@@ -198,21 +225,20 @@ jobs:
                   echo "server-side keys ready"
                   EOSH
 
-                  TS_IP=$(ssh -o StrictHostKeyChecking=no -i /tmp/ephemeral_key root@"$IP" "tailscale ip -4 | head -1")
+                  TS_IP=$($SSH "tailscale ip -4 | head -1")
                   if [ -z "$TS_IP" ]; then
                     echo "::error::tailscale join appeared to succeed but no IPv4 was assigned"
                     exit 1
                   fi
                   echo "ts_ip=$TS_IP" >> "$GITHUB_OUTPUT"
-                  echo "::notice::princess joined the tailnet as $TS_IP"
+                  echo "::notice::princess is on the tailnet as $TS_IP"
 
-                  # Last act: revoke this run's ephemeral key from the server.
-                  ssh -o StrictHostKeyChecking=no -i /tmp/ephemeral_key root@"$IP" \
-                    "sed -i '/princess-provision-ephemeral/d' /root/.ssh/authorized_keys"
+                  # Last act: revoke any provision-ephemeral key from the server.
+                  $SSH "sed -i '/princess-provision-ephemeral/d' /root/.ssh/authorized_keys"
 
             - name: 🧹 Cleanup runner key material
               if: always()
-              run: rm -f /tmp/ephemeral_key /tmp/ephemeral_key.pub
+              run: rm -f /tmp/ephemeral_key /tmp/ephemeral_key.pub /tmp/boot_key
 
             - name: 📋 Summary
               if: always()
