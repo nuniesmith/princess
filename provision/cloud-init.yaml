@@ -36,6 +36,19 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     ssh_authorized_keys:
       - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIISPnlFyF55VSInQ2MTULrBgwwKrSJfIpqiU9y9jtgTb jordan@desktop
+  # Automation user. Separate from jordan so that automated changes are
+  # attributable in logs and revocable on their own -- `userdel -r claude`
+  # ends its access without rotating jordan's key. Added to docker in runcmd.
+  #
+  # This was set up by hand on 2026-09-22 and would have been LOST on a
+  # rebuild; that is the whole reason it lives here now.
+  - name: claude
+    gecos: Claude automation
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGe/TXKI4lHF5/8scltcJ+gcSc3GPmD80jt94kfYoq8Z claude@oryx
 
 write_files:
   # Same hardening directives as freddy's drop-in. Named 00- (not 99-) because
@@ -61,7 +74,9 @@ write_files:
       LogLevel VERBOSE
       ClientAliveInterval 300
       ClientAliveCountMax 2
-      AllowUsers actions jordan root
+      # A user absent from this list is refused even with a perfect key --
+      # that is exactly how claude was locked out until 2026-09-22.
+      AllowUsers actions jordan root claude
 
   # Docker daemon hardening (same as freddy)
   - path: /etc/docker/daemon.json
@@ -113,6 +128,7 @@ runcmd:
   # Docker CE (official convenience script uses the same download.docker.com repo)
   - curl -fsSL https://get.docker.com | sh
   - usermod -aG docker actions
+  - usermod -aG docker claude
   - systemctl enable --now docker
   # Firewall: TAILNET-ONLY model — no public 80/443. nginx binds to the
   # tailscale IP (BIND_IP in .env), because Docker-published ports bypass UFW;
