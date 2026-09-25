@@ -1,0 +1,97 @@
+# ============================================================================
+# Daily maintenance for princess: apt packages and the edge nginx image
+# ============================================================================
+# Every morning:
+#   1. apt update + upgrade, through homelab-apt-upgrade on princess. Never
+#      reboots; the report says when a reboot is needed. The helper runs the
+#      upgrade as a systemd unit, so upgrading tailscale -- which drops the
+#      very connection this job arrives on -- cannot kill dpkg halfway.
+#   2. rebuilds nginx on a freshly pulled nginx:alpine, and recreates it only
+#      if that produced a different image. A new edge that does not come back
+#      healthy is rolled back to the one that was serving.
+#   3. posts to Discord when something changed or went wrong, and stays quiet
+#      on a morning with nothing to do.
+#
+# It also keeps ci-cd.yml's WEEKLY CERTIFICATE RENEWAL alive: GitHub switches
+# off a public repository's schedules after 60 days without a commit, and a
+# lapsed renewal is an expired wildcard certificate for every *.7gram.xyz.
+#
+# ONE-TIME SETUP on princess, for the apt half (installs the helper and the
+# one sudo rule that lets `actions` run it):
+#     sudo ./src/updates/install.sh      # in a checkout of nuniesmith/scripts
+# ============================================================================
+name: 🌅 Princess Daily Update
+
+on:
+    schedule:
+        # 09:47 UTC = 05:47 Toronto in summer, 04:47 in winter: the quietest
+        # hour for the edge. Princess has its own public IP, so it does not
+        # share Docker Hub's per-IP pull limit with freddy and sullivan.
+        - cron: "47 9 * * *"
+    workflow_dispatch:
+        inputs:
+            apt:
+                description: "Upgrade apt packages"
+                type: boolean
+                default: true
+            docker:
+                description: "Rebuild nginx on a fresh base image"
+                type: boolean
+                default: true
+
+permissions:
+    contents: read
+    actions: write # to wait for deploys in progress, and to keep the schedules alive
+
+# Never cancelled: stopping halfway through a recreate leaves the edge split
+# across two images.
+concurrency:
+    group: princess-daily-update
+    cancel-in-progress: false
+
+jobs:
+    update:
+        name: 🌅 Update princess
+        runs-on: ubuntu-latest
+        timeout-minutes: 90
+        steps:
+            - name: 🔌 Connect to Tailscale
+              uses: nuniesmith/actions/.github/actions/tailscale-connect@main
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+
+            # Same discovery as ci-cd.yml: an explicit PRINCESS_TAILSCALE_IP
+            # wins, otherwise ask the tailnet.
+            - name: 🎯 Locate princess on the tailnet
+              id: target
+              env:
+                  OVERRIDE: ${{ secrets.PRINCESS_TAILSCALE_IP }}
+              run: |
+                  IP=""
+                  case "$OVERRIDE" in 100.*) IP="$OVERRIDE" ;; esac
+                  [ -n "$IP" ] || IP=$(tailscale ip -4 princess 2>/dev/null | head -1) || true
+                  if [ -z "$IP" ]; then
+                    IP=$(tailscale status --json 2>/dev/null \
+                      | jq -r '.Peer[]? | select(.HostName == "princess") | .TailscaleIPs[]?' \
+                      | grep '^100\.' | head -1) || true
+                  fi
+                  # Left empty, the update step reports "could not SSH" to
+                  # Discord instead of this run failing where nobody looks.
+                  [ -n "$IP" ] || echo "::error::princess is not on the tailnet"
+                  echo "ip=$IP" >> "$GITHUB_OUTPUT"
+
+            - name: 🌅 Update
+              uses: nuniesmith/actions/.github/actions/host-update@main
+              with:
+                  host-name: princess
+                  host: ${{ steps.target.outputs.ip || 'princess-not-found' }}
+                  ssh-key: ${{ secrets.SSH_KEY }}
+                  ssh-user: ${{ secrets.SSH_USER || 'actions' }}
+                  ssh-port: ${{ secrets.SSH_PORT || '22' }}
+                  project-path: princess
+                  apt: ${{ github.event_name == 'schedule' || inputs.apt }}
+                  docker: ${{ github.event_name == 'schedule' || inputs.docker }}
+                  rebuild-services: nginx
+                  discord-webhook: ${{ secrets.DISCORD_WEBHOOK_ACTIONS }}
+                  keepalive-workflows: ci-cd.yml
