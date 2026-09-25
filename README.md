@@ -7,7 +7,7 @@ home servers:
 
 - **freddy** (`100.106.65.55`) — Nextcloud, PhotoPrism, Home Assistant,
   Audiobookshelf, Authentik, Uptime Kuma
-- **sullivan** (`100.87.125.19`) — Emby, Jellyfin, Plex, the *arr stack,
+- **sullivan** (`100.87.125.19`) — Emby, Plex, the *arr stack,
   qBittorrent, Tdarr, Mealie, Grocy, Wiki.js, …
 
 **Access model: tailnet-only** (same as freddy's edge today). DNS records
@@ -82,8 +82,6 @@ run.sh                        setup-env | start | stop | logs | status | health
 
 - All upstreams cross the tailnet (freddy's edge used `172.17.0.1` for its
   local services; that pattern is meaningless here).
-- **jellyfin** upstream fixed: freddy pointed at `:8920` (emby's HTTPS port);
-  sullivan actually publishes Jellyfin on host port `8097`.
 - **wiki** upstream fixed: freddy pointed at `:3000`; sullivan publishes
   Wiki.js on host port `8090`.
 - The HTTPS **default server is the 444 catch-all** (unknown hosts get
