@@ -7,6 +7,19 @@
 package_update: true
 package_upgrade: true
 
+# Linode boots this VM with ITS OWN GRUB 2, which reads /boot/grub/grub.cfg;
+# the disk is a bare ext4 filesystem with no boot code of its own. The Linode
+# image preseeds grub-pc/install_devices with the literal word "multiselect",
+# and that makes every noninteractive grub-pc upgrade fail: the postinst ends
+# in `exit 1`, leaving dpkg half-configured for every later apt run (and the
+# daily update job) to trip over. "No devices" is the true answer here. This
+# is applied before package_upgrade runs, so even the first boot is covered.
+apt:
+  debconf_selections:
+    grub-pc: |
+      grub-pc grub-pc/install_devices multiselect
+      grub-pc grub-pc/install_devices_empty boolean true
+
 # The provision workflow SSHes as root using a run-ephemeral key injected via
 # the Linode API — don't let cloud-init's Ubuntu default (disable_root: true)
 # rewrite root's authorized_keys.
