@@ -16,6 +16,8 @@ on:
             - "**.md"
             - "docs/**"
             - ".gitignore"
+            # Editing the daily updater is no reason to rebuild and restart the edge.
+            - ".github/workflows/daily-update.yml"
     workflow_dispatch:
         inputs:
             skip_deploy:
