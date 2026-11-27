@@ -7,7 +7,7 @@
 <style>
   :root {
     --bg: #0f1115; --card: #1a1d24; --text: #e6e6e6; --dim: #8b93a1;
-    --accent: #b48ead; --freddy: #88c0d0; --sullivan: #a3be8c;
+    --accent: #b48ead; --freddy: #88c0d0; --sullivan: #a3be8c; --oryx: #ebcb8b;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; padding: 2rem; }
@@ -22,13 +22,14 @@
   .badge { display: inline-block; margin-top: .6rem; font-size: .7rem; padding: .15rem .5rem; border-radius: 99px; text-transform: uppercase; letter-spacing: .05em; }
   .badge.freddy { background: rgba(136,192,208,.15); color: var(--freddy); }
   .badge.sullivan { background: rgba(163,190,140,.15); color: var(--sullivan); }
+  .badge.oryx { background: rgba(235,203,139,.15); color: var(--oryx); }
   h2 { max-width: 1100px; margin: 2rem auto 1rem; font-size: 1.1rem; color: var(--dim); }
 </style>
 </head>
 <body>
 <header>
   <h1>7gram<span>.xyz</span></h1>
-  <p class="sub">served from princess (Linode · Toronto) — proxied over Tailscale to freddy &amp; sullivan</p>
+  <p class="sub">served from princess (Linode · Toronto) — proxied over Tailscale to freddy, sullivan &amp; oryx</p>
 </header>
 
 <h2>Home &amp; Files — freddy</h2>
@@ -37,7 +38,7 @@
   <a class="card" href="https://photo.7gram.xyz"><h3>PhotoPrism</h3><p>Photos</p><span class="badge freddy">freddy</span></a>
   <a class="card" href="https://home.7gram.xyz"><h3>Home Assistant</h3><p>Home automation</p><span class="badge freddy">freddy</span></a>
   <a class="card" href="https://abs.7gram.xyz"><h3>Audiobookshelf</h3><p>Audiobooks &amp; podcasts</p><span class="badge freddy">freddy</span></a>
-  <a class="card" href="https://auth.7gram.xyz"><h3>Authentik</h3><p>Single sign-on</p><span class="badge freddy">freddy</span></a>
+  <a class="card" href="https://shelfmark.7gram.xyz"><h3>Shelfmark</h3><p>Book requests</p><span class="badge freddy">freddy</span></a>
   <a class="card" href="https://status.7gram.xyz"><h3>Uptime Kuma</h3><p>Service status</p><span class="badge freddy">freddy</span></a>
 </div>
 
@@ -46,7 +47,6 @@
   <a class="card" href="https://emby.7gram.xyz"><h3>Emby</h3><p>Media server</p><span class="badge sullivan">sullivan</span></a>
   <a class="card" href="https://plex.7gram.xyz"><h3>Plex</h3><p>Media server</p><span class="badge sullivan">sullivan</span></a>
   <a class="card" href="https://yt.7gram.xyz"><h3>YoutubeDL</h3><p>Video downloader</p><span class="badge sullivan">sullivan</span></a>
-  <a class="card" href="https://calibre.7gram.xyz"><h3>Calibre</h3><p>E-books</p><span class="badge sullivan">sullivan</span></a>
 </div>
 
 <h2>Management — sullivan</h2>
@@ -59,14 +59,18 @@
   <a class="card" href="https://qbt.7gram.xyz"><h3>qBittorrent</h3><p>Downloads</p><span class="badge sullivan">sullivan</span></a>
   <a class="card" href="https://tdarr.7gram.xyz"><h3>Tdarr</h3><p>Transcoding</p><span class="badge sullivan">sullivan</span></a>
   <a class="card" href="https://filebot.7gram.xyz"><h3>FileBot</h3><p>Renaming</p><span class="badge sullivan">sullivan</span></a>
-  <a class="card" href="https://duplicati.7gram.xyz"><h3>Duplicati</h3><p>Backups</p><span class="badge sullivan">sullivan</span></a>
 </div>
 
 <h2>Life — sullivan</h2>
 <div class="grid">
   <a class="card" href="https://mealie.7gram.xyz"><h3>Mealie</h3><p>Recipes</p><span class="badge sullivan">sullivan</span></a>
-  <a class="card" href="https://grocy.7gram.xyz"><h3>Grocy</h3><p>Groceries</p><span class="badge sullivan">sullivan</span></a>
   <a class="card" href="https://wiki.7gram.xyz"><h3>Wiki.js</h3><p>Documentation</p><span class="badge sullivan">sullivan</span></a>
+</div>
+
+<h2>Trading &amp; Testing — oryx</h2>
+<div class="grid">
+  <a class="card" href="https://fks.7gram.xyz"><h3>FKS</h3><p>Trading platform</p><span class="badge oryx">oryx</span></a>
+  <a class="card" href="https://parlour.7gram.xyz"><h3>Parlour</h3><p>Media server (testing)</p><span class="badge oryx">oryx</span></a>
 </div>
 </body>
 </html>
